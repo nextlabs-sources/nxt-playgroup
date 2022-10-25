@@ -1,0 +1,318 @@
+Description: Control Center Server (using Postgres RDS) Template
+Mappings:
+  AWSRegionAmazAMI:
+    us-east-1:
+      id: ami-e0b8af9f
+Conditions:
+  ProvisionedIOPS: !Equals [ !Ref ControlCenterStorageType, 'io1' ]
+Resources:
+  ControlCenterInstance:
+    Properties:
+      UserData:
+        Fn::Base64: !Sub |
+          #cloud-config
+          output: { all: "| tee -a /var/log/cloud-init-output.log" }
+          repo_update: true
+          repo_upgrade: all
+
+          packages:
+          - unzip
+          - nfs-utils
+          - nginx
+
+          write_files:
+          - path: /tmp/createdb.sql
+            owner: root:root
+            permissions: '0644'
+            content: |
+              CREATE ROLE ${DBControlCenterName} NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOLOGIN;
+              CREATE ROLE ${DBControlCenterUsername} NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT LOGIN ENCRYPTED PASSWORD '${DBControlCenterPassword}';
+              GRANT ${DBControlCenterName} TO ${DBControlCenterUsername};
+              CREATE DATABASE ${DBControlCenterName}
+                WITH
+                  CONNECTION LIMIT = -1;
+              REVOKE ALL ON DATABASE ${DBControlCenterName} FROM public;
+              ALTER DATABASE ${DBControlCenterName} OWNER TO ${DBControlCenterUsername};
+          - path: /tmp/changehearbeat.sql
+            owner: root:root
+            permissions: '0644'
+            content: >
+              UPDATE comm_profile SET heart_beat_freq_time_unit='minutes',
+              heart_beat_freq_time=${HeartbeatIntervalInMinutes}
+              WHERE agent_type IN ('DESKTOP', 'FILE_SERVER', 'PORTAL');
+          - path: /tmp/setAdministratorEmail.sql
+            owner: root:root
+            permissions: '0644'
+            content: >
+              UPDATE super_application_user SET email='${CCAdministratorEmail}' WHERE username = 'Administrator';
+          - path: /opt/post_controlcenter_stat.sh
+            owner: root:root
+            permissions: '0755'
+            content: |
+              #!/bin/bash
+              LOGQUEUE_DIR='/opt/nextlabs/PolicyServer/server/logqueue'
+              CW_JSON_OPEN='{ "Namespace": "ControlCenter", "MetricData": [ '
+              CW_JSON_CLOSE=' ] }'
+              SIZE_METRIC_NAME='LogqueueSize'
+              COUNT_METRIC_NAME='LogQueueCount'
+              INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
+              SIZE_METRIC_VALUE=$(find $LOGQUEUE_DIR -type f -print0 | du -scb --files0-from=- | tail -n 1 | cut -f1)
+              COUNT_METRIC_VALUE=$(find /opt/nextlabs/PolicyServer/server/logqueue -type f | wc -l)
+              SIZE_CW_JSON_METRIC="{ \"MetricName\": \"$SIZE_METRIC_NAME\", \"Dimensions\": [{\"Name\": \"InstanceId\", \"Value\": \"$INSTANCE_ID\"} ], \"Value\": $SIZE_METRIC_VALUE, \"Unit\": \"Bytes\" }"
+              COUNT_CW_JSON_METRIC="{ \"MetricName\": \"$COUNT_METRIC_NAME\", \"Dimensions\": [{\"Name\": \"InstanceId\", \"Value\": \"$INSTANCE_ID\"} ], \"Value\": $COUNT_METRIC_VALUE, \"Unit\": \"Count\" }"
+              aws cloudwatch put-metric-data --region ${AWS::Region} --cli-input-json "`echo $CW_JSON_OPEN $SIZE_CW_JSON_METRIC $CW_JSON_CLOSE`"
+              aws cloudwatch put-metric-data --region ${AWS::Region} --cli-input-json "`echo $CW_JSON_OPEN $COUNT_CW_JSON_METRIC $CW_JSON_CLOSE`"
+          - path: /root/unregister_unhealthy_managed_jpc.sql
+            owner: root:root
+            permissions: '0644'
+            content: >
+              update agent
+              set registered = false
+              where
+                agent.host like 'ip-%-managed'
+                and agent.registered = true
+                and (
+                  (exists (
+                    select * from comm_profile as cp where agent.comm_profile_id = cp.id and cp.heart_beat_freq_time_unit = 'minutes'
+                  ) and (agent.lastheartbeat < (extract(epoch from current_timestamp) * 1000 - 2 * 60000 *
+                    (select cp.heart_beat_freq_time from comm_profile as cp where agent.comm_profile_id = cp.id and cp.heart_beat_freq_time_unit = 'minutes')
+                  )))
+                  or
+                  (exists(
+                    select * from comm_profile as cp where agent.comm_profile_id = cp.id and cp.heart_beat_freq_time_unit = 'hours'
+                  ) and (agent.lastheartbeat < (extract(epoch from current_timestamp) * 1000 - 2 * 3600000 *
+                    (select cp.heart_beat_freq_time from comm_profile as cp where agent.comm_profile_id = cp.id and cp.heart_beat_freq_time_unit = 'hours')
+                  )))
+                  or
+                  (exists(
+                    select * from comm_profile as cp where agent.comm_profile_id = cp.id and cp.heart_beat_freq_time_unit = 'days'
+                  ) and (agent.lastheartbeat < (extract(epoch from current_timestamp) * 1000 - 2 * 86400000 *
+                    (select cp.heart_beat_freq_time from comm_profile as cp where agent.comm_profile_id = cp.id and cp.heart_beat_freq_time_unit = 'days')
+                  )))
+                )
+          - path: /opt/unregister_unhealthy_managed_jpc.sh
+            owner: root:root
+            permissions: '0755'
+            content: |
+              #!/bin/bash
+              export PGDATABASE=${DBControlCenterName}
+              export PGHOST=${RDSInstanceEndpointAddress}
+              export PGPASSWORD=${DBControlCenterPassword}
+              export PGPORT=5432
+              export PGUSER=${DBControlCenterUsername}
+
+              service=CompliantEnterpriseServer
+
+              if (( $(ps -ef | grep -v grep | grep $service | wc -l) > 0 ))
+              then
+              /usr/bin/psql -f /root/unregister_unhealthy_managed_jpc.sql -v ON_ERROR_STOP=1
+              else
+              echo "$service is not running"
+              fi
+          - path: /opt/crontab
+            owner: root:root
+            permissions: '0644'
+            content: |
+              * * * * * /opt/post_controlcenter_stat.sh > /dev/null 2>&1
+              */5 * * * * /opt/unregister_unhealthy_managed_jpc.sh > /dev/null 2>&1
+          - path: /tmp/createAPIUser.sql
+            owner: root:root
+            permissions: '0644'
+            content: |
+              INSERT INTO APPLICATION_USER (ID,USER_TYPE,USERNAME,FIRST_NAME,LAST_NAME,STATUS,VERSION,DOMAIN_ID,PASSWORD,LAST_UPDATED_BY,CREATED_BY,DISPLAYNAME,HIDE_SPLASH,AUTH_HANDLER_ID)
+              VALUES (10000,'internal','${APIUser}','api','client','ACTIVE',0,11, decode(md5('${APIUserPassword}'), 'hex'),0,0,'api client',false,0);
+
+              INSERT INTO APP_USER_PROPERTIES (ID,VERSION,DATA_TYPE,PROP_KEY,USER_ID,PROP_VALUE) VALUES (10000,0,'STRING','jwt_passphrase',10000, 'JWTSECRET');
+          - path: /tmp/updateAPIUserFirstLogin.sql
+            owner: root:root
+            permissions: '0644'
+            content: |
+              CREATE OR REPLACE FUNCTION conditional_update_apiuser() RETURNS void AS
+              $$
+              begin
+                perform column_name from information_schema.columns where table_schema = 'public' and table_name = 'application_user' and column_name = 'initlogin_done';
+                if found then
+                  update application_user set initlogin_done = 'Y' where username = 'apiclient';
+                end if;
+              end;
+              $$ language plpgsql;
+              select conditional_update_apiuser();
+              drop function conditional_update_apiuser();
+
+          runcmd:
+          - sed -i s/HOSTNAME=.*/HOSTNAME=${ControlCenterHostname}.${DNSDomain}/ /etc/sysconfig/network
+          - echo ${ControlCenterHostname}.${DNSDomain} > /etc/hostname
+          - echo "127.0.0.1  ${ControlCenterHostname}.${DNSDomain} ${ControlCenterHostname}" >> /etc/hosts
+          - hostname ${ControlCenterHostname}.${DNSDomain}
+          - >-
+            PGDATABASE=${DBMasterName}
+            PGHOST=${RDSInstanceEndpointAddress}
+            PGPASSWORD=${DBMasterUserPassword}
+            PGPORT=5432
+            PGUSER=${DBMasterUsername}
+            /usr/bin/psql -f /tmp/createdb.sql -v ON_ERROR_STOP=1
+          - ln -sf /usr/share/zoneinfo/PST8PDT /etc/localtime
+          - >-
+            AWS_ACCESS_KEY_ID=${S3AccessKeyID} AWS_SECRET_ACCESS_KEY=${S3SecretAccessKey}
+            aws s3 cp ${CCInstallerS3Url} /tmp/ControlCenter.zip
+          - >-
+            AWS_ACCESS_KEY_ID=${S3AccessKeyID} AWS_SECRET_ACCESS_KEY=${S3SecretAccessKey}
+            aws s3 cp ${LicenseS3Url} /usr/local/license.dat
+          - unzip -o -q /tmp/ControlCenter.zip -d /usr/local
+          - chmod +x /usr/local/PolicyServer/install.sh
+          - |
+            cat > /usr/local/PolicyServer/cc_properties.json <<EOF
+            {
+              "installation_dir": "/opt/nextlabs",
+              "installation_mode": "install",
+              "console_install_mode": "SAAS",
+              "web_service_port": "8443",
+              "web_application_port": "443",
+              "admin_user_password": "${AdminPassword}",
+              "ssl_certificate_password": "${SSLCertPassword}",
+              "key_store_password": "${KeystorePassword}",
+              "dms_component": "ON",
+              "dac_component": "ON",
+              "dps_component": "ON",
+              "dem_component": "ON",
+              "ddac_component": "ON",
+              "admin_component": "ON",
+              "reporter_component": "ON",
+              "dabs_component": "ON",
+              "dkms_component": "ON",
+              "cc_console_component": "ON",
+              "installation_type": "complete",
+              "ad_domain_name": "",
+              "ad_domain_controller": "",
+              "ad_domain_port": null,
+              "ad_base_DN": null,
+              "ad_username": null,
+              "ad_password": null,
+              "database_type": "POSTGRES",
+              "db_connection_url": "postgresql://${RDSInstanceEndpointAddress}:5432/${DBControlCenterName}",
+              "db_username": "${DBControlCenterUsername}",
+              "db_password": "${DBControlCenterPassword}",
+              "mail_server_url": "${MailServerURL}",
+              "mail_server_port": "${MailServerPort}",
+              "mail_server_username": "${MailServerUsername}",
+              "mail_server_password": "${MailServerPasssord}",
+              "mail_server_from": "${MailServerFrom}",
+              "mail_server_to": "${MailServerTo}",
+              "mail_server_ssl": "${MailServerSSL}",
+              "skip_ad_check": false,
+              "skip_smtp_check": true,
+              "server": {
+                "jvmms": 2048,
+                "jvmmx": ${ControlCenterJVMMX}
+              },
+              "license_file_location": "/usr/local/license.dat"
+            }
+            EOF
+          - /usr/local/PolicyServer/install.sh -s
+          - >-
+            PGDATABASE=${DBControlCenterName}
+            PGHOST=${RDSInstanceEndpointAddress}
+            PGPASSWORD=${DBControlCenterPassword}
+            PGPORT=5432
+            PGUSER=${DBControlCenterUsername}
+            /usr/bin/psql -f /tmp/changehearbeat.sql -v ON_ERROR_STOP=1
+          - >-
+            /opt/nextlabs/PolicyServer/java/bin/java -jar /opt/nextlabs/PolicyServer/tools/crypt/crypt.jar
+            -w '${LicenseInfo}' > /opt/nextlabs/PolicyServer/server/license/sys_info.dat
+          - >-
+            PGDATABASE=${DBControlCenterName}
+            PGHOST=${RDSInstanceEndpointAddress}
+            PGPASSWORD=${DBControlCenterPassword}
+            PGPORT=5432
+            PGUSER=${DBControlCenterUsername}
+            /usr/bin/psql  -f /tmp/setAdministratorEmail.sql -v ON_ERROR_STOP=1
+          - >-
+            AWS_ACCESS_KEY_ID=${S3AccessKeyID} AWS_SECRET_ACCESS_KEY=${S3SecretAccessKey}
+            aws s3 cp ${CCSamplePolicyS3Url} /opt/nextlabs/PolicyServer/server/resources/help/
+          - mkdir /mnt/efs
+          - >-
+            echo "$(curl -s http://169.254.169.254/latest/meta-data/placement/availability-zone).${EFSFileSystem}.efs.${AWS::Region}.amazonaws.com:/ /mnt/efs
+            nfs4 nfsvers=4.1,rsize=1048576,wsize=1048576,hard,timeo=600,retrans=2 0 0" >> /etc/fstab
+          - mount /mnt/efs
+          - mkdir -p /mnt/efs/control_center
+          - mkdir -p /mnt/efs/control_center/certificates /mnt/efs/control_center/configuration
+          - rm -rf /mnt/efs/control_center/certificates/*
+          - rm -rf /mnt/efs/control_center/configuration/*
+          - cp -rf /opt/nextlabs/PolicyServer/server/configuration/* /mnt/efs/control_center/configuration/
+          - cp -rf /opt/nextlabs/PolicyServer/server/certificates/* /mnt/efs/control_center/certificates/
+          - rm -rf /opt/nextlabs/PolicyServer/server/configuration
+          - rm -rf /opt/nextlabs/PolicyServer/server/certificates
+          - chmod -R 777 /mnt/efs/control_center
+          - ln -s /mnt/efs/control_center/certificates /opt/nextlabs/PolicyServer/server/certificates
+          - ln -s /mnt/efs/control_center/configuration /opt/nextlabs/PolicyServer/server/configuration
+          - crontab /opt/crontab
+          - >-
+            AWS_ACCESS_KEY_ID=${S3AccessKeyID} AWS_SECRET_ACCESS_KEY=${S3SecretAccessKey}
+            aws s3 cp ${Oauth2JWTSecretPluginS3Url} /tmp/Oauth2JWTSecret-Plugin.zip
+          - unzip -o -q /tmp/Oauth2JWTSecret-Plugin.zip -d /tmp/Oauth2JWTSecret-Plugin
+          - mkdir -p /opt/nextlabs/PolicyServer/server/plugins/jar /opt/nextlabs/PolicyServer/server/plugins/config
+          - find "/tmp/Oauth2JWTSecret-Plugin/Control Center" -type f -name "*.properties" -exec cp "{}" /opt/nextlabs/PolicyServer/server/plugins/config \;
+          - find "/tmp/Oauth2JWTSecret-Plugin/Control Center" -type f -name "*.jar" -exec cp "{}" /opt/nextlabs/PolicyServer/server/plugins/jar/ \;
+          - rm -rf /tmp/Oauth2JWTSecret-Plugin.zip /tmp/Oauth2JWTSecret-Plugin
+          - sed -i "s|JWTSECRET|$(openssl rand -base64 32)|" /tmp/createAPIUser.sql
+          - >-
+            PGDATABASE=${DBControlCenterName}
+            PGHOST=${RDSInstanceEndpointAddress}
+            PGPASSWORD=${DBControlCenterPassword}
+            PGPORT=5432
+            PGUSER=${DBControlCenterUsername}
+            /usr/bin/psql -f /tmp/createAPIUser.sql -v ON_ERROR_STOP=1
+          - >-
+            PGDATABASE=${DBControlCenterName}
+            PGHOST=${RDSInstanceEndpointAddress}
+            PGPASSWORD=${DBControlCenterPassword}
+            PGPORT=5432
+            PGUSER=${DBControlCenterUsername}
+            /usr/bin/psql -f /tmp/updateAPIUserFirstLogin.sql -v ON_ERROR_STOP=1
+          - sudo /etc/init.d/ControlCenterES start
+          - sudo /etc/init.d/CompliantEnterpriseServer start
+          - >-
+            openssl req -x509 -nodes -days 3650 -newkey rsa:2048
+            -subj "/C=US/ST=CA/L=San Mateo/O=NextLabs/OU=CompliantEnterprise/CN=${ControlCenterHostname}.${DNSDomain}"
+            -keyout /etc/nginx/server.key
+            -out /etc/nginx/server.crt
+          - chmod 600 /etc/nginx/server.crt
+          - chmod 600 /etc/nginx/server.key
+          - rm -rf /etc/nginx/conf.d/*
+          - |
+            cat > /etc/nginx/conf.d/cc.conf <<EOF
+            server {
+              listen 1443;
+              server_name _;
+              ssl_certificate           /etc/nginx/server.crt;
+              ssl_certificate_key       /etc/nginx/server.key;
+              ssl on;
+              ssl_session_cache  builtin:1000  shared:SSL:10m;
+              ssl_protocols  TLSv1 TLSv1.1 TLSv1.2;
+              ssl_ciphers HIGH:!aNULL:!eNULL:!EXPORT:!CAMELLIA:!DES:!MD5:!PSK:!RC4;
+              ssl_prefer_server_ciphers on;
+
+              location /help {
+                proxy_pass http://cloudazhelpsystem.s3-website-us-west-2.amazonaws.com/production;
+              }
+              location /cas {
+                proxy_set_header Host \$host;
+                proxy_pass https://localhost/cas;
+              }
+              location /reporter {
+                proxy_set_header Host \$host;
+                proxy_pass https://localhost/reporter;
+              }
+              location /console {
+                proxy_set_header Host \$host;
+                proxy_pass https://localhost/console;
+              }
+              proxy_connect_timeout       600;
+              proxy_send_timeout          600;
+              proxy_read_timeout          600;
+              send_timeout                600;
+            }
+            EOF
+          - chkconfig --level 345 nginx on
+          - service nginx start
+    Type: AWS::EC2::Instance

@@ -1,0 +1,16 @@
+image: python:3.5.1
+
+pipelines:
+  custom:
+    push2PlatformStagingS3:
+      - step:
+          script:
+          - env
+          - sed -i 's@cloudazhelpsystem.s3-website-us-west-2.amazonaws.com/production@cloudazhelpsystem.s3-website-us-west-2.amazonaws.com/staging@' ${BITBUCKET_CLONE_DIR}/cc_postgres.yaml
+          - grep cloudazhelpsystem  ${BITBUCKET_CLONE_DIR}/cc_postgres.yaml
+
+    push2PlatformProductionS3:
+      - step:
+          script:
+          - env
+          - grep cloudazhelpsystem  ${BITBUCKET_CLONE_DIR}/cc_postgres.yaml
